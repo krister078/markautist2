@@ -8,33 +8,33 @@ int factorial(int n)
     if (n <= 1)
     {
         return 1;
+
+        return n * factorial(n - 1);
     }
-    return n * factorial(n - 1);
-}
 
-// Function to check if a number is prime
-int isPrime(int num)
-{
-    if (num <= 1)
-        return 0;
-    if (num <= 3)
-        return 1;
-    if (num % 2 == 0 || num % 3 == 0)
-        return 0;
-
-    for (int i = 5; i * i <= num; i += 6)
+    // Function to check if a nuber is prime
+    int isPrime(int num)
     {
-        if (num % i == 0 || num % (i + 2) == 0)
-        {
+        if (num <= 1)
             return 0;
-        }
-    }
-    return 1;
-}
+        if (num <= 3)
+            return 1;
+        if (num % 2 == 0 || num % 3 == 0)
+            return
 
-// Function to reverse a string
-void reverseString(char *str)
-{
+                for (int i = 5; i * i <= num; += 6)
+            {
+                if (num % i == 0 || num % (i + 2) == 0)
+                {
+                    return 0;
+                }
+            }
+        return 1;
+    }
+
+    // Function to reverse a strin
+void reverseString(char *str
+
     int len = strlen(str);
     for (int i = 0; i < len / 2; i++)
     {
@@ -61,7 +61,7 @@ int main()
     char text[] = "Hello World";
     printf("3. Original string: %s\n", text);
     reverseString(text);
-    printf("   Reversed string: %s\n", text);
+    printf("   Reversed string: %s\n", text
 
     // Simple loop demonstration
     printf("4. Numbers 1-10: ");
@@ -79,12 +79,11 @@ int main()
     for (int i = 0; i < size; i++)
     {
         sum += numbers[i];
-    }
 
-    printf("5. Array sum: %d\n", sum);
-    printf("   Array average: %.2f\n", (float)sum / size);
+        printf("5. Array sum: %d\n", sum);
+        printf("   Array average: %.2f\n", (float)sum / size);
 
-    printf("\nProgram completed successfully!\n");
+        printf("\nProgram completed successfully!\n");
 
-    return 0;
+        return 0;
 }
