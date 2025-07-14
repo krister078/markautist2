@@ -1,0 +1,114 @@
+name: Workflow Manager
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      force_check:
+        description: 'Force check for updates regardless of PR template'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  check-update-request:
+    runs-on: ubuntu-latest
+    outputs:
+      should_update: ${{ steps.check_template.outputs.should_update }}
+      should_run_review: ${{ steps.check_template.outputs.should_run_review }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Check PR template for update request
+        id: check_template
+        run: |
+          # Default values
+          SHOULD_UPDATE="false"
+          SHOULD_RUN_REVIEW="true"
+          
+          # Force check if workflow_dispatch with force_check
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_check }}" = "true" ]; then
+            SHOULD_UPDATE="true"
+          elif [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            # Get PR body/description directly from GitHub context first
+            PR_BODY='${{ github.event.pull_request.body }}'
+            
+            # Check if the PR template has X marked for loading latest agent updates
+            if echo "$PR_BODY" | grep -q -i "\[x\].*load.*latest.*agent.*updates\|load.*latest.*agent.*updates.*\[x\]"; then
+              SHOULD_UPDATE="true"
+            elif echo "$PR_BODY" | grep -q -i "\[X\].*load.*latest.*agent.*updates\|load.*latest.*agent.*updates.*\[X\]"; then
+              SHOULD_UPDATE="true"
+            fi
+          fi
+          echo "should_update=$SHOULD_UPDATE" >> $GITHUB_OUTPUT
+          echo "should_run_review=$SHOULD_RUN_REVIEW" >> $GITHUB_OUTPUT
+
+  # Trigger agent update workflow if needed
+  trigger-agent-update:
+    needs: check-update-request
+    if: needs.check-update-request.outputs.should_update == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    
+    steps:
+      - name: Trigger agent update workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('Triggering agent update workflow...');
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'agent-update.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: '${{ github.event.pull_request.number }}',
+                pr_head_sha: '${{ github.event.pull_request.head.sha }}',
+                pr_base_sha: '${{ github.event.pull_request.base.sha }}',
+                pr_author: '${{ github.event.pull_request.user.login }}'
+              }
+            });
+            
+            console.log('Agent update workflow triggered successfully');
+
+  # Run AI review directly if no update is needed
+  trigger-direct-review:
+    needs: check-update-request
+    if: needs.check-update-request.outputs.should_update == 'false' && needs.check-update-request.outputs.should_run_review == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    
+    steps:
+      - name: Trigger AI review workflow directly
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('Triggering AI review workflow directly...');
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ai-review.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: '${{ github.event.pull_request.number }}',
+                pr_head_sha: '${{ github.event.pull_request.head.sha }}',
+                pr_base_sha: '${{ github.event.pull_request.base.sha }}',
+                pr_author: '${{ github.event.pull_request.user.login }}'
+              }
+            });
+            
+            console.log('AI review workflow triggered successfully');

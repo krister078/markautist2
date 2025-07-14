@@ -1,0 +1,443 @@
+name: AI Code Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
+      pr_head_sha:
+        description: "PR head SHA"
+        required: true
+        type: string
+      pr_base_sha:
+        description: "PR base SHA"
+        required: true
+        type: string
+      pr_author:
+        description: "PR author"
+        required: true
+        type: string
+      updated_commit_sha:
+        description: "Updated commit SHA (if agent was updated)"
+        required: false
+        type: string
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Get PR information
+        id: pr_info
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: parseInt('${{ github.event.inputs.pr_number }}')
+            });
+
+            console.log('PR info retrieved:', {
+              title: pr.title,
+              body: pr.body ? pr.body.substring(0, 200) + '...' : 'No body',
+              draft: pr.draft,
+              head_repo: pr.head.repo.full_name,
+              base_repo: pr.base.repo.full_name
+            });
+
+            // Set outputs for use in subsequent steps
+            core.setOutput('pr_title', pr.title);
+            core.setOutput('pr_body', pr.body || '');
+            core.setOutput('pr_draft', pr.draft);
+            core.setOutput('head_repo', pr.head.repo.full_name);
+            core.setOutput('base_repo', pr.base.repo.full_name);
+            core.setOutput('pr_labels', JSON.stringify(pr.labels.map(label => label.name)));
+
+      - name: Check if should skip review
+        id: should_skip
+        run: |
+          # Skip if PR is from a fork to avoid secrets exposure or if it's a draft
+          if [ "${{ steps.pr_info.outputs.head_repo }}" != "${{ steps.pr_info.outputs.base_repo }}" ]; then
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            echo "skip_reason=fork" >> $GITHUB_OUTPUT
+            echo "Skipping review: PR is from a fork"
+          elif [ "${{ steps.pr_info.outputs.pr_draft }}" = "true" ]; then
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            echo "skip_reason=draft" >> $GITHUB_OUTPUT
+            echo "Skipping review: PR is a draft"
+          else
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+            echo "Proceeding with review"
+          fi
+
+      - name: Checkout full repo history
+        if: steps.should_skip.outputs.should_skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.updated_commit_sha || 'main' }}
+
+      - name: Set up Python and install dependencies
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 -m pip install --upgrade pip > /dev/null 2>&1
+            pip install firebase-admin anthropic openai > /dev/null 2>&1
+
+      - name: Initialize AI cost tracking
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            cd .github/workflows/scripts && python3 -c "from cost_tracker import initialize_cost_tracking; initialize_cost_tracking()"
+
+      - name: Fetch configuration macros from Firebase
+        id: fetch-macros
+        continue-on-error: true
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/fetch_macros.py
+
+      - name: Parse macros from PR description
+        id: parse-pr-macros
+        if: steps.should_skip.outputs.should_skip == 'false'
+        continue-on-error: true
+        env:
+          PR_BODY: ${{ steps.pr_info.outputs.pr_body }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/parse_pr_macros.py
+
+      - name: Resolve final macro configuration
+        id: resolve-macros
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            # Priority: PR description > Firebase > defaults
+
+            # LINE_THRESHOLD
+            if [ -n "${{ steps.parse-pr-macros.outputs.pr_line_threshold }}" ]; then
+              LINE_THRESHOLD="${{ steps.parse-pr-macros.outputs.pr_line_threshold }}"
+            elif [ -n "${{ steps.fetch-macros.outputs.line_threshold }}" ]; then
+              LINE_THRESHOLD="${{ steps.fetch-macros.outputs.line_threshold }}"
+            else
+              LINE_THRESHOLD="200"
+            fi
+
+            # CHANGES_THRESHOLD
+            if [ -n "${{ steps.parse-pr-macros.outputs.pr_changes_threshold }}" ]; then
+              CHANGES_THRESHOLD="${{ steps.parse-pr-macros.outputs.pr_changes_threshold }}"
+            elif [ -n "${{ steps.fetch-macros.outputs.changes_threshold }}" ]; then
+              CHANGES_THRESHOLD="${{ steps.fetch-macros.outputs.changes_threshold }}"
+            else
+              CHANGES_THRESHOLD="5"
+            fi
+
+            # CUSTOM_AI_PROMPT (only from PR description)
+            if [ -n "${{ steps.parse-pr-macros.outputs.pr_custom_ai_prompt }}" ]; then
+              CUSTOM_AI_PROMPT="${{ steps.parse-pr-macros.outputs.pr_custom_ai_prompt }}"
+            else
+              CUSTOM_AI_PROMPT=""
+            fi
+
+            # IMPORTANT_CHANGE_MARKERS (only from Firebase or defaults - not configurable in PR)
+            if [ -n "${{ steps.fetch-macros.outputs.important_change_markers }}" ]; then
+              IMPORTANT_CHANGE_MARKERS="${{ steps.fetch-macros.outputs.important_change_markers }}"
+            else
+              IMPORTANT_CHANGE_MARKERS="#IMPORTANT-CHANGE,#IMPORTANT-CHANGES"
+            fi
+
+            # IMPORTANT_CHANGE_LABELS (only from Firebase or defaults - not configurable in PR )
+            if [ -n "${{ steps.fetch-macros.outputs.important_change_labels }}" ]; then
+              IMPORTANT_CHANGE_LABELS="${{ steps.fetch-macros.outputs.important_change_labels }}"
+            else
+              IMPORTANT_CHANGE_LABELS="important change,important changes"
+            fi
+
+            # Set outputs
+            echo "line_threshold=$LINE_THRESHOLD" >> "$GITHUB_OUTPUT"
+            echo "changes_threshold=$CHANGES_THRESHOLD" >> "$GITHUB_OUTPUT"
+            echo "custom_ai_prompt=$CUSTOM_AI_PROMPT" >> "$GITHUB_OUTPUT"
+            echo "important_change_markers=$IMPORTANT_CHANGE_MARKERS" >> "$GITHUB_OUTPUT"
+            echo "important_change_labels=$IMPORTANT_CHANGE_LABELS" >> "$GITHUB_OUTPUT"
+
+            # Log the resolved values
+            echo "Resolved macro configuration:"
+            echo "  LINE_THRESHOLD: $LINE_THRESHOLD"
+            echo "  CHANGES_THRESHOLD: $CHANGES_THRESHOLD"
+            echo "  CUSTOM_AI_PROMPT: $CUSTOM_AI_PROMPT"
+            echo "  IMPORTANT_CHANGE_MARKERS: $IMPORTANT_CHANGE_MARKERS"
+            echo "  IMPORTANT_CHANGE_LABELS: $IMPORTANT_CHANGE_LABELS"
+
+      - name: Generate diff between base and head (excluding workflow file)
+        id: diff
+        if: steps.should_skip.outputs.should_skip == 'false'
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 2
+          max_attempts: 2
+          retry_on: both
+          command: |
+            BASE_SHA="${{ github.event.inputs.pr_base_sha }}"
+            HEAD_SHA="${{ github.event.inputs.pr_head_sha }}"
+
+            git fetch origin "$BASE_SHA" "$HEAD_SHA"
+
+            DIFF=$(git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude).github/**')
+            echo "diff_b64=$(printf '%s' "$DIFF" | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+            LINE_COUNT=$(echo "$DIFF" | grep -c '^[+-]' || echo "0")
+            echo "line_count=$LINE_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Check for important changes
+        id: check-important
+        if: steps.should_skip.outputs.should_skip == 'false'
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            # Get macro values from resolved macros
+            IMPORTANT_CHANGE_MARKERS="${{ steps.resolve-macros.outputs.important_change_markers }}"
+            IMPORTANT_CHANGE_LABELS="${{ steps.resolve-macros.outputs.important_change_labels }}"
+
+            # Check for important change markers in title
+            HAS_IMPORTANT_TITLE=false
+            if echo '${{ steps.pr_info.outputs.pr_title }}' | grep -q -E "$(echo "$IMPORTANT_CHANGE_MARKERS" | sed 's/,/|/g')"; then
+              HAS_IMPORTANT_TITLE=true
+            fi
+
+            # Check for important change labels
+            HAS_IMPORTANT_LABEL=false
+            if echo '${{ steps.pr_info.outputs.pr_labels }}' | grep -q -E "$(echo "$IMPORTANT_CHANGE_LABELS" | sed 's/,/|/g')"; then
+              HAS_IMPORTANT_LABEL=true
+            fi
+
+            # Check PR description for checkboxes
+            PR_BODY='${{ steps.pr_info.outputs.pr_body }}'
+
+            # Check for "Do you have important changes?" checkbox marked with X
+            HAS_IMPORTANT_CHECKBOX=false
+            if echo "$PR_BODY" | grep -q -E '\[X\].*[Dd]o you have important changes'; then
+              HAS_IMPORTANT_CHECKBOX=true
+            fi
+
+            # Check for "Do you want to explicitly use Claude Sonnet 4?" checkbox marked with X
+            USE_CLAUDE_CHECKBOX=false
+            if echo "$PR_BODY" | grep -q -E '\[X\].*[Dd]o you want to explicitly use Claude Sonnet 4'; then
+              USE_CLAUDE_CHECKBOX=true
+            fi
+
+            # Determine if this is an important change
+            IS_IMPORTANT_CHANGE=false
+            if [ "$HAS_IMPORTANT_TITLE" = "true" ] || [ "$HAS_IMPORTANT_LABEL" = "true" ] || [ "$HAS_IMPORTANT_CHECKBOX" = "true" ]; then
+              IS_IMPORTANT_CHANGE=true
+            fi
+
+            echo "has_important_title=$HAS_IMPORTANT_TITLE" >> "$GITHUB_OUTPUT"
+            echo "has_important_label=$HAS_IMPORTANT_LABEL" >> "$GITHUB_OUTPUT"
+            echo "has_important_checkbox=$HAS_IMPORTANT_CHECKBOX" >> "$GITHUB_OUTPUT"
+            echo "use_claude_checkbox=$USE_CLAUDE_CHECKBOX" >> "$GITHUB_OUTPUT"
+            echo "is_important_change=$IS_IMPORTANT_CHANGE" >> "$GITHUB_OUTPUT"
+
+      - name: Track architecture changes in Firebase
+        id: track-arch
+        if: steps.should_skip.outputs.should_skip == 'false' && steps.check-important.outputs.is_important_change == 'true'
+        continue-on-error: true
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          CHANGES_THRESHOLD: ${{ steps.resolve-macros.outputs.changes_threshold }}
+          DIFF_B64: ${{ steps.diff.outputs.diff_b64 }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.inputs.pr_head_sha }}
+          BASE_SHA: ${{ github.event.inputs.pr_base_sha }}
+          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
+          PR_AUTHOR: ${{ github.event.inputs.pr_author }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/track_architecture.py
+
+      - name: Summarize architecture if needed
+        if: steps.should_skip.outputs.should_skip == 'false' && steps.check-important.outputs.is_important_change == 'true' && steps.track-arch.outcome == 'success' && contains(steps.track-arch.outputs.should_summarize, 'true')
+        continue-on-error: true
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHANGES_THRESHOLD: ${{ steps.resolve-macros.outputs.changes_threshold }}
+          REPOSITORY: ${{ github.repository }}
+          SHOULD_SUMMARIZE: "true"
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          DIFF_B64: ${{ steps.diff.outputs.diff_b64 }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 3
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/summarize_architecture.py
+
+      - name: Fetch architecture context from Firebase
+        id: fetch-context
+        if: steps.should_skip.outputs.should_skip == 'false'
+        continue-on-error: true
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          CHANGES_THRESHOLD: ${{ steps.resolve-macros.outputs.changes_threshold }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/fetch_firebase_context.py
+
+      - name: Choose model based on line count and labels
+        id: choose-model
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            THRESHOLD=${{ steps.resolve-macros.outputs.line_threshold }}
+            LINES=${{ steps.diff.outputs.line_count }}
+            HAS_IMPORTANT_LABEL=${{ steps.check-important.outputs.has_important_label }}
+            HAS_IMPORTANT_TITLE=${{ steps.check-important.outputs.has_important_title }}
+            HAS_IMPORTANT_CHECKBOX=${{ steps.check-important.outputs.has_important_checkbox }}
+            USE_CLAUDE_CHECKBOX=${{ steps.check-important.outputs.use_claude_checkbox }}
+
+            # Set outputs for use in next steps
+            echo "has_important_label=$HAS_IMPORTANT_LABEL" >> "$GITHUB_OUTPUT"
+            echo "has_important_title=$HAS_IMPORTANT_TITLE" >> "$GITHUB_OUTPUT"
+            echo "has_important_checkbox=$HAS_IMPORTANT_CHECKBOX" >> "$GITHUB_OUTPUT"
+            echo "use_claude_checkbox=$USE_CLAUDE_CHECKBOX" >> "$GITHUB_OUTPUT"
+            echo "line_threshold=$THRESHOLD" >> "$GITHUB_OUTPUT"
+
+            # Model selection logic:
+            # 1. If explicit Claude checkbox is checked -> use Claude
+            # 2. If has important label, title marker, or important checkbox -> use Claude
+            # 3. If no label/title/checkbox but exceeds threshold -> use Claude
+            # 4. Otherwise -> use gpt-4.1-nano-2025-04-14
+            if [ "$USE_CLAUDE_CHECKBOX" = "true" ]; then
+              echo "model=claude-sonnet-4-20250514" >> "$GITHUB_OUTPUT"
+              echo "model_comment=This response was generated by Claude 4 Sonnet (explicitly requested via checkbox)." >> "$GITHUB_OUTPUT"
+              echo "Using Claude due to explicit request (checkbox: $USE_CLAUDE_CHECKBOX)"
+            elif [ "$HAS_IMPORTANT_LABEL" = "true" ] || [ "$HAS_IMPORTANT_TITLE" = "true" ] || [ "$HAS_IMPORTANT_CHECKBOX" = "true" ]; then
+              echo "model=claude-sonnet-4-20250514" >> "$GITHUB_OUTPUT"
+              echo "model_comment=This response was generated by Claude 4 Sonnet (important changes detected)." >> "$GITHUB_OUTPUT"
+              echo "Using Claude due to important changes (label: $HAS_IMPORTANT_LABEL, title: $HAS_IMPORTANT_TITLE, checkbox: $HAS_IMPORTANT_CHECKBOX)"
+            elif [ "$LINES" -gt "$THRESHOLD" ]; then
+              echo "model=claude-sonnet-4-20250514" >> "$GITHUB_OUTPUT"
+              echo "model_comment=This response was generated by Claude 4 Sonnet (large diff detected)." >> "$GITHUB_OUTPUT"
+              echo "Using Claude due to large diff ($LINES lines > $THRESHOLD threshold)"
+            else
+              echo "model=gpt-4.1-nano-2025-04-14" >> "$GITHUB_OUTPUT"
+              echo "model_comment=This response was generated by gpt 4.1 nano." >> "$GITHUB_OUTPUT"
+              echo "Using gpt-4.1-nano-2025-04-14 for small diff ($LINES lines <= $THRESHOLD threshold)"
+            fi
+
+      - name: Call AI for code review
+        id: ai-review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DIFF_B64: ${{ steps.diff.outputs.diff_b64 }}
+          MODEL: ${{ steps.choose-model.outputs.model }}
+          HAS_IMPORTANT_LABEL: ${{ steps.choose-model.outputs.has_important_label }}
+          LINE_THRESHOLD: ${{ steps.choose-model.outputs.line_threshold }}
+          ARCHITECTURE_CONTEXT_B64: ${{ steps.fetch-context.outputs.context_b64 }}
+          CUSTOM_AI_PROMPT: ${{ steps.resolve-macros.outputs.custom_ai_prompt }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 2
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/ai_review.py
+
+      - name: Display AI costs so far
+        if: always()
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            echo "=== AI COST CHECKPOINT AFTER REVIEW ==="
+            python3 .github/workflows/scripts/display_costs.py
+
+      - name: Post line-by-line comments on PR
+        if: steps.should_skip.outputs.should_skip == 'false'
+        env:
+          REVIEW_TEXT: ${{ steps.ai-review.outputs.review_b64 }}
+          MODEL_COMMENT: ${{ steps.choose-model.outputs.model_comment }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.inputs.pr_head_sha }}
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 2
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 .github/workflows/scripts/post_comments.py
+
+      - name: Upload AI response as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-response-output
+          path: |
+            /tmp/ai_response.txt
+            /tmp/line_comment.json
+            /tmp/summary_comment.json
+            /tmp/ai_costs.json
+            /tmp/ai_cost_summary.txt
+          retention-days: 7
+
+      - name: Finalize AI cost tracking and display summary
+        id: cost-summary
+        if: always()
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1
+          max_attempts: 2
+          retry_on: both
+          command: |
+            echo "=== FINAL AI COST SUMMARY ==="
+            cd .github/workflows/scripts && python3 -c "from cost_tracker import finalize_cost_tracking; finalize_cost_tracking()"

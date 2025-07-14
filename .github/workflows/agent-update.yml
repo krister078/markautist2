@@ -1,0 +1,579 @@
+name: Agent Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number that triggered the update'
+        required: true
+        type: string
+      pr_head_sha:
+        description: 'PR head SHA'
+        required: true
+        type: string
+      pr_base_sha:
+        description: 'PR base SHA'
+        required: true
+        type: string
+      pr_author:
+        description: 'PR author'
+        required: true
+        type: string
+
+jobs:
+  update-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU for multi-platform support
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Diagnose Docker environment
+        run: |
+          echo "Docker version:"
+          docker version
+          echo ""
+          echo "Docker info:"
+          docker info | head -20
+          echo ""
+          echo "Available platforms:"
+          docker buildx ls
+          echo ""
+          echo "Testing Docker Hub connectivity:"
+          curl -s -I https://registry.hub.docker.com/v2/ | head -3
+
+      - name: Create workspace directories
+        run: |
+          mkdir -p /tmp/old-image /tmp/new-image /tmp/extracted-old /tmp/extracted-new
+          
+      - name: Set up Python and install dependencies
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 1       
+          max_attempts: 2
+          retry_on: both
+          command: |
+            python3 -m pip install --upgrade pip > /dev/null 2>&1
+            pip install firebase-admin anthropic openai > /dev/null 2>&1
+
+      - name: Test Docker Hub connectivity
+        run: |
+          # Test with authentication header
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:kaloyangavrilov/github-workflows:pull" | jq -r .token)
+          curl -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/kaloyangavrilov/github-workflows/manifests/latest || true
+          
+          # Try direct Docker pull
+          docker pull kaloyangavrilov/github-workflows:latest || true
+
+      - name: Get current image digest from Firebase
+        id: current_digest
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          # Use the Docker image manager script to get the stored digest
+          cd .github/workflows/scripts
+          DIGEST_OUTPUT=$(python3 docker_image_manager.py get_digest "kaloyangavrilov/github-workflows")
+          echo "$DIGEST_OUTPUT" >> $GITHUB_OUTPUT
+
+      - name: Verify Docker image exists
+        id: verify_image
+        run: |
+          # Check if image exists using Docker Hub API first
+          API_RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/kaloyangavrilov/github-workflows/" 2>/dev/null || echo "")
+          
+          if echo "$API_RESPONSE" | jq -e '.name == "github-workflows"' > /dev/null 2>&1; then
+            echo "✅ Docker repository exists on Hub"
+            echo "Repository info:"
+            echo "$API_RESPONSE" | jq -r '"Name: \(.name), Status: \(.status_description), Private: \(.is_private), Pull Count: \(.pull_count)"'
+            
+            # Check available architectures using registry API with auth
+            TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:kaloyangavrilov/github-workflows:pull" | jq -r .token 2>/dev/null || echo "")
+            
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+              MANIFEST_INFO=$(curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" "https://registry-1.docker.io/v2/kaloyangavrilov/github-workflows/manifests/latest" 2>/dev/null || echo "")
+              
+              if [ -n "$MANIFEST_INFO" ]; then
+                echo "Available platforms:"
+                echo "$MANIFEST_INFO" | jq -r '.manifests[]?.platform | select(. != null) | "  - \(.architecture)/\(.os)"' 2>/dev/null || echo "  - Could not parse platforms"
+                
+                # Check if arm64 is available
+                HAS_ARM64=$(echo "$MANIFEST_INFO" | jq -r '.manifests[]?.platform | select(.architecture == "arm64" and .os == "linux") | .architecture' 2>/dev/null || echo "")
+                HAS_AMD64=$(echo "$MANIFEST_INFO" | jq -r '.manifests[]?.platform | select(.architecture == "amd64" and .os == "linux") | .architecture' 2>/dev/null || echo "")
+                
+                if [ -n "$HAS_AMD64" ]; then
+                  PLATFORM="linux/amd64"
+                elif [ -n "$HAS_ARM64" ]; then
+                  PLATFORM="linux/arm64"
+                else
+                  exit 1
+                fi
+              else
+                PLATFORM="linux/arm64"
+              fi
+            else
+              PLATFORM="linux/arm64"
+            fi
+            if docker pull --platform "$PLATFORM" kaloyangavrilov/github-workflows:latest; then
+              echo "✅ Successfully pulled with platform: $PLATFORM"
+              echo "image_exists=true" >> $GITHUB_OUTPUT
+              echo "platform=$PLATFORM" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Failed to pull Docker image even with platform specification"
+              echo "image_exists=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          else
+            echo "❌ Docker repository 'kaloyangavrilov/github-workflows' API check failed"
+            echo "API Response: $API_RESPONSE"
+            echo "image_exists=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Get latest image digest
+        if: steps.verify_image.outputs.image_exists == 'true'
+        id: latest_digest
+        run: |
+          echo "🔍 Getting digest for kaloyangavrilov/github-workflows:latest..."
+          
+          # Since we already pulled the image, inspect it locally
+          INSPECT_OUTPUT=$(docker inspect kaloyangavrilov/github-workflows:latest 2>&1)
+          INSPECT_EXIT_CODE=$?
+          
+          if [ $INSPECT_EXIT_CODE -eq 0 ]; then
+            # Try to extract digest from RepoDigests
+            LATEST_DIGEST=$(echo "$INSPECT_OUTPUT" | jq -r '.[0].RepoDigests[0]' 2>/dev/null | cut -d'@' -f2 2>/dev/null || echo "")
+            
+            if [ -z "$LATEST_DIGEST" ] || [ "$LATEST_DIGEST" = "null" ]; then
+              echo "Trying alternative RepoDigests extraction..."
+              ALL_REPO_DIGESTS=$(echo "$INSPECT_OUTPUT" | jq -r '.[0].RepoDigests[]?' 2>/dev/null || echo "")
+              echo "All RepoDigests: $ALL_REPO_DIGESTS"
+              
+              # Try to get any digest from the list
+              LATEST_DIGEST=$(echo "$ALL_REPO_DIGESTS" | head -1 | cut -d'@' -f2 2>/dev/null || echo "")
+              echo "First available digest: '$LATEST_DIGEST'"
+            fi
+          else
+            echo "❌ Docker inspect failed"
+            exit 1
+          fi
+          
+          # Fallback: use buildx imagetools
+          if [ -z "$LATEST_DIGEST" ] || [ "$LATEST_DIGEST" = "null" ]; then
+            BUILDX_DIGEST=$(docker buildx imagetools inspect kaloyangavrilov/github-workflows:latest --format '{{json .}}' 2>&1 | jq -r '.manifest.digest' 2>/dev/null || echo "")
+            
+            if [ -n "$BUILDX_DIGEST" ] && [ "$BUILDX_DIGEST" != "null" ]; then
+              LATEST_DIGEST="$BUILDX_DIGEST"
+            fi
+          fi
+          
+          if [ -z "$LATEST_DIGEST" ] || [ "$LATEST_DIGEST" = "null" ]; then
+            echo "❌ Could not determine image digest"
+            exit 1
+          fi
+          
+          echo "latest_digest=$LATEST_DIGEST" >> $GITHUB_OUTPUT
+          echo "✅ Final digest: $LATEST_DIGEST"
+
+      - name: Compare digests and determine if update needed
+        if: steps.verify_image.outputs.image_exists == 'true'
+        id: compare
+        run: |
+          STORED="${{ steps.current_digest.outputs.stored_digest }}"
+          LATEST="${{ steps.latest_digest.outputs.latest_digest }}"
+          
+          echo "Stored digest: '$STORED'"
+          echo "Latest digest: '$LATEST'"
+          
+          if [ -z "$STORED" ] || [ "$STORED" = "" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "is_first_run=true" >> $GITHUB_OUTPUT
+            echo "✅ First run detected - will extract all files from image"
+          elif [ "$STORED" != "$LATEST" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "✅ Image has been updated - will extract changes"
+            echo "Previous: $STORED"
+            echo "New: $LATEST"
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "✅ Image is up to date - no changes needed"
+          fi
+
+      - name: Extract files from images
+        if: steps.verify_image.outputs.image_exists == 'true' && steps.compare.outputs.needs_update == 'true'
+        run: |
+          set -e
+          
+          PLATFORM="${{ steps.verify_image.outputs.platform }}"
+          echo "🔍 Using platform: $PLATFORM"
+          
+          # Extract files from latest image
+          echo "Extracting files from latest image..."
+          
+          # Create container with detected platform
+          if CONTAINER_ID=$(docker create --platform "$PLATFORM" kaloyangavrilov/github-workflows:latest 2>/dev/null); then
+            echo "Container created successfully: $CONTAINER_ID"
+          else
+            if CONTAINER_ID=$(docker create kaloyangavrilov/github-workflows:latest 2>/dev/null); then
+              echo "Container created without platform: $CONTAINER_ID"
+            else
+              exit 1
+            fi
+          fi
+          
+          # Based on your extract script, the .github directory is at /app/.github
+          echo "Attempting to extract .github directory from /app/.github..."
+          if docker cp $CONTAINER_ID:/app/.github /tmp/extracted-new/ 2>/dev/null; then
+            echo "Found .github directory at /app/.github"
+          else
+            # Try other possible locations as fallback
+            if docker cp $CONTAINER_ID:/.github /tmp/extracted-new/ 2>/dev/null; then
+              echo "Found .github directory at root"
+            elif docker cp $CONTAINER_ID:/workspace/.github /tmp/extracted-new/ 2>/dev/null; then
+              echo "Found .github directory at /workspace"
+            else
+              # Try to explore the container structure safely
+              if docker cp $CONTAINER_ID:/ /tmp/container-root/ 2>/dev/null; then
+                # Find .github directory anywhere in the container
+                GITHUB_DIR=$(find /tmp/container-root -name ".github" -type d | head -1)
+                if [ -n "$GITHUB_DIR" ]; then
+                  cp -r "$GITHUB_DIR" /tmp/extracted-new/
+                else
+                  echo "❌ No .github directory found in the container"
+                  echo "Container root structure:"
+                  ls -la /tmp/container-root/ | head -10
+                  echo "Looking for any .github directories recursively:"
+                  find /tmp/container-root -name "*github*" -type d | head -5
+                  docker rm $CONTAINER_ID
+                  exit 1
+                fi
+              else
+                echo "❌ Failed to explore container filesystem"
+                docker rm $CONTAINER_ID
+                exit 1
+              fi
+            fi
+          fi
+          
+          docker rm $CONTAINER_ID
+          
+          # If not first run, extract from old image using stored digest
+          if [ "${{ steps.compare.outputs.is_first_run }}" = "false" ]; then
+            echo "Pulling old image with digest ${{ steps.current_digest.outputs.stored_digest }}..."
+            
+            # Try pulling old image with platform specification if needed
+            if docker pull kaloyangavrilov/github-workflows@${{ steps.current_digest.outputs.stored_digest }} 2>/dev/null; then
+              echo "✅ Old image pulled successfully"
+            else
+              echo "🔍 Trying to pull old image with platform specification..."
+              if docker pull --platform linux/amd64 kaloyangavrilov/github-workflows@${{ steps.current_digest.outputs.stored_digest }} 2>/dev/null; then
+                echo "✅ Old image pulled with linux/amd64"
+              elif docker pull --platform linux/arm64 kaloyangavrilov/github-workflows@${{ steps.current_digest.outputs.stored_digest }} 2>/dev/null; then
+                echo "✅ Old image pulled with linux/arm64"
+              else
+                echo "⚠️  Could not pull old image, will treat as first run"
+                mkdir -p /tmp/extracted-old/.github
+                exit 0
+              fi
+            fi
+            
+            echo "Extracting files from old image..."
+            if OLD_CONTAINER_ID=$(docker create kaloyangavrilov/github-workflows@${{ steps.current_digest.outputs.stored_digest }} 2>/dev/null); then
+              # Use the same path as for the latest image: /app/.github
+              docker cp $OLD_CONTAINER_ID:/app/.github /tmp/extracted-old/ || {
+                echo "Warning: .github directory not found in old image at /app/.github"
+                mkdir -p /tmp/extracted-old/.github
+              }
+              docker rm $OLD_CONTAINER_ID
+            else
+              echo "Warning: Failed to create container from old image"
+              mkdir -p /tmp/extracted-old/.github
+            fi
+          else
+            # First run - create empty old directory
+            mkdir -p /tmp/extracted-old/.github
+          fi
+
+      - name: Identify and copy changed files
+        if: steps.compare.outputs.needs_update == 'true'
+        run: |
+          set -e
+          
+          # Ensure the .github directory exists in the repo
+          mkdir -p .github
+          
+          # Create ignore patterns for system files
+          IGNORE_PATTERNS=(".DS_Store" "Thumbs.db" "*.tmp" "*.temp" "*.swp" "*.swo" "*~")
+          
+          # Function to check if a file should be ignored
+          should_ignore() {
+            local file="$1"
+            local basename=$(basename "$file")
+            
+            for pattern in "${IGNORE_PATTERNS[@]}"; do
+              if [[ "$basename" == $pattern ]]; then
+                return 0  # Should ignore
+              fi
+            done
+            return 1  # Should not ignore
+          }
+          
+          if [ "${{ steps.compare.outputs.is_first_run }}" = "true" ]; then
+            echo "First run - copying all files from image (excluding system files)..."
+            if [ -d "/tmp/extracted-new/.github" ]; then
+              # Copy files while excluding ignored patterns using process substitution
+              find /tmp/extracted-new/.github -type f > /tmp/all_files.txt
+              
+              while IFS= read -r source_file; do
+                if ! should_ignore "$source_file"; then
+                  rel_path=$(echo "$source_file" | sed 's|/tmp/extracted-new/.github/||')
+                  dest_dir=$(dirname ".github/$rel_path")
+                  mkdir -p "$dest_dir"
+                  cp "$source_file" ".github/$rel_path"
+                fi
+              done < /tmp/all_files.txt
+              
+              # Clean up temporary file
+              rm -f /tmp/all_files.txt
+            fi
+          else
+            echo "Comparing old and new versions..."
+            
+            # Find all files in new version using process substitution to avoid subshell issues
+            if [ -d "/tmp/extracted-new/.github" ]; then
+              # Create temporary file lists to avoid subshell problems
+              find /tmp/extracted-new/.github -type f > /tmp/new_files.txt
+              
+              # Process each file from the new version
+              while IFS= read -r new_file; do
+                if should_ignore "$new_file"; then
+                  continue
+                fi
+                
+                rel_path=$(echo "$new_file" | sed 's|/tmp/extracted-new/.github/||')
+                old_file="/tmp/extracted-old/.github/$rel_path"
+                
+                should_copy=false
+                
+                if [ ! -f "$old_file" ]; then
+                  echo "New file detected: $rel_path"
+                  should_copy=true
+                elif ! cmp -s "$new_file" "$old_file"; then
+                  echo "Modified file detected: $rel_path"
+                  should_copy=true
+                fi
+                
+                if [ "$should_copy" = true ]; then
+                  dest_dir=$(dirname ".github/$rel_path")
+                  mkdir -p "$dest_dir"
+                  cp "$new_file" ".github/$rel_path"
+                fi
+              done < /tmp/new_files.txt
+              
+              # Check for deleted files
+              if [ -d "/tmp/extracted-old/.github" ]; then
+                find /tmp/extracted-old/.github -type f > /tmp/old_files.txt
+                
+                while IFS= read -r old_file; do
+                  if should_ignore "$old_file"; then
+                    continue
+                  fi
+                  
+                  rel_path=$(echo "$old_file" | sed 's|/tmp/extracted-old/.github/||')
+                  new_file="/tmp/extracted-new/.github/$rel_path"
+                  
+                  if [ ! -f "$new_file" ]; then
+                    echo "Deleted file detected: $rel_path"
+                    if [ -f ".github/$rel_path" ]; then
+                      rm ".github/$rel_path"
+                    fi
+                  fi
+                done < /tmp/old_files.txt
+              fi
+              
+              # Clean up temporary files
+              rm -f /tmp/new_files.txt /tmp/old_files.txt
+            else
+              echo "No .github directory found in new image"
+            fi
+          fi
+
+      - name: Update digest in Firebase
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          LATEST_DIGEST: ${{ steps.latest_digest.outputs.latest_digest }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          # Use the Docker image manager script to update the digest
+          cd .github/workflows/scripts
+          python3 docker_image_manager.py update_digest "kaloyangavrilov/github-workflows" "$LATEST_DIGEST" "latest" "$GITHUB_REPOSITORY" "agent-update-workflow"
+
+      - name: Check for actual changes in git
+        if: steps.compare.outputs.needs_update == 'true'
+        id: git_changes
+        run: |
+          git config --global user.name "Agent Update Bot"
+          git config --global user.email "agent-updates@github.com"
+          
+          # Add all changes (excluding the digest file since we use Firebase now)
+          git add .github/
+          
+          # Check if there are any changes to commit
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            # Show what changed
+            git diff --cached --name-only
+          fi
+
+      - name: Commit and push changes
+        if: steps.compare.outputs.needs_update == 'true' && steps.git_changes.outputs.has_changes == 'true'
+        id: commit_changes
+        run: |
+          # Always push to main branch
+          BRANCH_NAME="main"
+          
+          echo "Pushing to branch: $BRANCH_NAME"
+          
+          # Commit changes
+          if [ "${{ steps.compare.outputs.is_first_run }}" = "true" ]; then
+            git commit -m "🤖 Initial agent setup from kaloyangavrilov/github-workflows:latest
+
+            - Extracted .github folder from Docker image
+            - Image digest stored in Firebase: ${{ steps.latest_digest.outputs.latest_digest }}"
+          else
+            git commit -m "🤖 Update agent from kaloyangavrilov/github-workflows:latest
+
+            - Updated from digest: ${{ steps.current_digest.outputs.stored_digest }}
+            - Updated to digest: ${{ steps.latest_digest.outputs.latest_digest }}
+            - Digest tracking via Firebase"
+          fi
+          
+          # Push changes
+          git push origin "$BRANCH_NAME"
+          
+          # Get the new commit SHA
+          NEW_COMMIT_SHA=$(git rev-parse HEAD)
+          echo "new_commit_sha=$NEW_COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "✅ Pushed changes with new commit SHA: $NEW_COMMIT_SHA"
+
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          # Clean up containers and images to save space
+          docker system prune -f --volumes || true
+          
+          # Remove temporary directories
+          rm -rf /tmp/old-image /tmp/new-image /tmp/extracted-old /tmp/extracted-new /tmp/container-root || true
+
+      - name: Trigger AI review with updated files
+        if: steps.compare.outputs.needs_update == 'true' && steps.git_changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('Agent files updated successfully. Triggering AI review with latest commit...');
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ai-review.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: '${{ github.event.inputs.pr_number }}',
+                pr_head_sha: '${{ github.event.inputs.pr_head_sha }}',
+                pr_base_sha: '${{ github.event.inputs.pr_base_sha }}',
+                pr_author: '${{ github.event.inputs.pr_author }}',
+                updated_commit_sha: '${{ steps.commit_changes.outputs.new_commit_sha }}'
+              }
+            });
+            
+            console.log('AI review workflow triggered with updated agent files');
+
+      - name: Trigger AI review without changes
+        if: steps.compare.outputs.needs_update == 'true' && steps.git_changes.outputs.has_changes == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('No agent file changes needed. Triggering AI review...');
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ai-review.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: '${{ github.event.inputs.pr_number }}',
+                pr_head_sha: '${{ github.event.inputs.pr_head_sha }}',
+                pr_base_sha: '${{ github.event.inputs.pr_base_sha }}',
+                pr_author: '${{ github.event.inputs.pr_author }}'
+              }
+            });
+            
+            console.log('AI review workflow triggered (no agent updates needed)');
+
+      - name: Trigger AI review when no update needed
+        if: steps.compare.outputs.needs_update == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            console.log('Agent is up to date. Triggering AI review workflow...');
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ai-review.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: '${{ github.event.inputs.pr_number }}',
+                pr_head_sha: '${{ github.event.inputs.pr_head_sha }}',
+                pr_base_sha: '${{ github.event.inputs.pr_base_sha }}',
+                pr_author: '${{ github.event.inputs.pr_author }}'
+              }
+            });
+            
+            console.log('AI review workflow triggered (agent already up to date)');
+
+      - name: Output update summary
+        run: |
+          echo "## Agent Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.compare.outputs.needs_update }}" = "true" ]; then
+            if [ "${{ steps.compare.outputs.is_first_run }}" = "true" ]; then
+              echo "- ✅ First run: Extracted all files from kaloyangavrilov/github-workflows:latest" >> $GITHUB_STEP_SUMMARY
+              echo "- 📝 Image digest stored in Firebase: ${{ steps.latest_digest.outputs.latest_digest }}" >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ steps.git_changes.outputs.has_changes }}" = "true" ]; then
+              echo "- ✅ Updated agent files from kaloyangavrilov/github-workflows:latest" >> $GITHUB_STEP_SUMMARY
+              echo "- 🔄 Previous digest: ${{ steps.current_digest.outputs.stored_digest }}" >> $GITHUB_STEP_SUMMARY
+              echo "- 🆕 New digest: ${{ steps.latest_digest.outputs.latest_digest }}" >> $GITHUB_STEP_SUMMARY
+              echo "- 🚀 New commit SHA: ${{ steps.commit_changes.outputs.new_commit_sha }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ✅ Agent is up to date, no file changes needed" >> $GITHUB_STEP_SUMMARY
+              echo "- 📋 Current digest: ${{ steps.latest_digest.outputs.latest_digest }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- ✅ Agent is already using the latest version" >> $GITHUB_STEP_SUMMARY
+            echo "- 📋 Current digest: ${{ steps.latest_digest.outputs.latest_digest }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "- 🎯 AI review workflow triggered for PR #${{ github.event.inputs.pr_number }}" >> $GITHUB_STEP_SUMMARY
